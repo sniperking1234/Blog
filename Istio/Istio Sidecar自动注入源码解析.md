@@ -120,7 +120,99 @@ func injectRequired(ignored []string, config *Config, podSpec *corev1.PodSpec, m
 5. 判断 Pod 的标签是否在 `istio-sidecar-injector` cm 中的 alwaysInjectSelector 配置当中。如果有，则开启注入，此配置会覆盖条件 3。如果已经通过了条件 4 ，则不会进入到条件 5 当中。
 6. 如果没有进入过条件 3、4、5，那么此时 `useDefault` 为 `true`，这时候判断`istio-sidecar-injector` cm 中的 policy 字段，如果是 `enable`，则开启 Sidecar 注入。
 
+## 注入 Pod
+如果符合 Sidecar 注入条件，那么就开启 Pod 注入，进入到`injectPod`函数中。在这个函数中，又调用`InjectionData`方法，生成了注入的 pod yaml。
+```go
+func InjectionData(params InjectionParameters, typeMetadata *metav1.TypeMeta, deploymentMetadata *metav1.ObjectMeta) (
+	*SidecarInjectionSpec, string, error) {
+	spec := &params.pod.Spec
+	metadata := &params.pod.ObjectMeta
+	meshConfig := params.meshConfig
+	// 判断pod中的dns策略是否是 ClusterFirst
+	if spec.DNSPolicy != "" && spec.DNSPolicy != corev1.DNSClusterFirst {
+		podName := potentialPodName(metadata)
+		log.Warnf("%q's DNSPolicy is not %q. The Envoy sidecar may not able to connect to Istio Pilot",
+			metadata.Namespace+"/"+podName, corev1.DNSClusterFirst)
+	}
+	
+	// 多集群配置略过
+	...
+
+	// 将配置字符串解析到values里面，这里的配置是istio-sidecar-injector cm中 values 的数据内容
+	values := map[string]interface{}{}
+	if err := yaml.Unmarshal([]byte(params.valuesConfig), &values); err != nil {
+		...
+	}
+    
+	// 初始化yaml和配置合集的变量
+	data := SidecarTemplateData{
+		TypeMeta:       typeMetadata,
+		DeploymentMeta: deploymentMetadata,
+		ObjectMeta:     metadata,
+		Spec:           spec,
+		ProxyConfig:    meshConfig.GetDefaultConfig(),
+		MeshConfig:     meshConfig,
+		Values:         values,
+	}
+
+	funcMap := template.FuncMap{
+		...
+	}
+
+	// Allows the template to use env variables from istiod.
+	// Istiod will use a custom template, without 'values.yaml', and the pod will have
+	// an optional 'vendor' configmap where additional settings can be defined.
+	funcMap["env"] = func(key string, def string) string {
+		val := os.Getenv(key)
+		if val == "" {
+			return def
+		}
+		return val
+	}
+
+	// Need to use FuncMap and SidecarTemplateData context
+	funcMap["render"] = func(template string) string {
+		bbuf, err := parseTemplate(template, funcMap, data)
+		if err != nil {
+			return ""
+		}
+
+		return bbuf.String()
+	}
+
+	// 使用现有数据填充模板，模板是istio-sidecar-injector cm中 template 的数据内容
+	bbuf, err := parseTemplate(params.template, funcMap, data)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// 将buf中的数据解析到 SidecarInjectionSpec 数据结构中
+	var sic SidecarInjectionSpec
+	if err := yaml.Unmarshal(bbuf.Bytes(), &sic); err != nil {
+		...
+	}
+
+	// 根据容器 cpu 核数设置并行 https://github.com/istio/istio/issues/11268
+	applyConcurrency(sic.Containers)
+	// 多集群需要配置
+	overwriteClusterInfo(sic.Containers, params)
+
+	// 配置 sidecar 注入状态
+	status := &SidecarInjectionStatus{Version: params.version}
+	...
+
+	// 配置 sidecar 启动之后在启动业务容器这个特性 https://github.com/istio/istio/pull/24737
+	sic.HoldApplicationUntilProxyStarts = meshConfig.DefaultConfig.HoldApplicationUntilProxyStarts.GetValue() ||
+		valuesStruct.GetGlobal().GetProxy().GetHoldApplicationUntilProxyStarts().GetValue()
+
+	return &sic, string(statusAnnotationValue), nil
+}
+```
+
 ## 参考
 https://www.luozhiyun.com/archives/397
 https://www.cnblogs.com/saneri/p/13553979.html
-
+https://istio.io/latest/docs/setup/additional-setup/sidecar-injection/
+http://www.ichenfu.com/2018/12/20/k8s-pod-dns-policy/
+https://github.com/istio/istio/issues/11268
+https://github.com/istio/istio/pull/24737
