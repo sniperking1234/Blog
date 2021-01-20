@@ -159,26 +159,7 @@ func InjectionData(params InjectionParameters, typeMetadata *metav1.TypeMeta, de
 		...
 	}
 
-	// Allows the template to use env variables from istiod.
-	// Istiod will use a custom template, without 'values.yaml', and the pod will have
-	// an optional 'vendor' configmap where additional settings can be defined.
-	funcMap["env"] = func(key string, def string) string {
-		val := os.Getenv(key)
-		if val == "" {
-			return def
-		}
-		return val
-	}
-
-	// Need to use FuncMap and SidecarTemplateData context
-	funcMap["render"] = func(template string) string {
-		bbuf, err := parseTemplate(template, funcMap, data)
-		if err != nil {
-			return ""
-		}
-
-		return bbuf.String()
-	}
+	...
 
 	// 使用现有数据填充模板，模板是istio-sidecar-injector cm中 template 的数据内容
 	bbuf, err := parseTemplate(params.template, funcMap, data)
@@ -208,11 +189,17 @@ func InjectionData(params InjectionParameters, typeMetadata *metav1.TypeMeta, de
 	return &sic, string(statusAnnotationValue), nil
 }
 ```
+在上面的方法中，通过用户的配置，将这些配置应用的模板 Yaml 中，从而生成 Sidecar 的注入信息。并且返回注入信息的结构体和注入状态。
 
 ## 参考
 https://www.luozhiyun.com/archives/397
+
 https://www.cnblogs.com/saneri/p/13553979.html
+
 https://istio.io/latest/docs/setup/additional-setup/sidecar-injection/
+
 http://www.ichenfu.com/2018/12/20/k8s-pod-dns-policy/
+
 https://github.com/istio/istio/issues/11268
+
 https://github.com/istio/istio/pull/24737
