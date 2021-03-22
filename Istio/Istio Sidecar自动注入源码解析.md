@@ -191,6 +191,85 @@ func InjectionData(params InjectionParameters, typeMetadata *metav1.TypeMeta, de
 ```
 在上面的方法中，通过用户的配置，将这些配置应用的模板 Yaml 中，从而生成 Sidecar 的注入信息。并且返回注入信息的结构体和注入状态。
 
+`InjectionData`方法调用完成之后，返回到`injectPod`方法，在这个方法中，会调用`createPatch`方法生成要新增的 patch 数据。下面看一下这个方法的代码：
+```go
+func createPatch(pod *corev1.Pod, prevStatus *SidecarInjectionStatus, revision string, annotations map[string]string,
+	sic *SidecarInjectionSpec, workloadName string, mesh *meshconfig.MeshConfig) ([]byte, error) {
+
+	var patch []rfc6902PatchOperation
+
+	rewrite := ShouldRewriteAppHTTPProbers(pod.Annotations, sic)
+
+	sidecar := FindSidecar(sic.Containers)
+	// We don't have to escape json encoding here when using golang libraries.
+	if rewrite && sidecar != nil {
+		if prober := DumpAppProbers(&pod.Spec); prober != "" {
+			sidecar.Env = append(sidecar.Env, corev1.EnvVar{Name: status.KubeAppProberEnvName, Value: prober})
+		}
+	}
+
+	if rewrite {
+		patch = append(patch, createProbeRewritePatch(pod.Annotations, &pod.Spec, sic, mesh.GetDefaultConfig().GetStatusPort())...)
+	}
+
+	// Remove any containers previously injected by kube-inject using
+	// container and volume name as unique key for removal.
+	patch = append(patch, removeContainers(pod.Spec.InitContainers, prevStatus.InitContainers, "/spec/initContainers")...)
+	patch = append(patch, removeContainers(pod.Spec.Containers, prevStatus.Containers, "/spec/containers")...)
+	patch = append(patch, removeVolumes(pod.Spec.Volumes, prevStatus.Volumes, "/spec/volumes")...)
+	patch = append(patch, removeImagePullSecrets(pod.Spec.ImagePullSecrets, prevStatus.ImagePullSecrets, "/spec/imagePullSecrets")...)
+
+	if enablePrometheusMerge(mesh, pod.ObjectMeta.Annotations) {
+		scrape := status.PrometheusScrapeConfiguration{
+			Scrape: pod.ObjectMeta.Annotations["prometheus.io/scrape"],
+			Path:   pod.ObjectMeta.Annotations["prometheus.io/path"],
+			Port:   pod.ObjectMeta.Annotations["prometheus.io/port"],
+		}
+		empty := status.PrometheusScrapeConfiguration{}
+		if sidecar != nil && scrape != empty {
+			by, err := json.Marshal(scrape)
+			if err != nil {
+				return nil, err
+			}
+			sidecar.Env = append(sidecar.Env, corev1.EnvVar{Name: status.PrometheusScrapingConfig.Name, Value: string(by)})
+		}
+		annotations["prometheus.io/port"] = strconv.Itoa(int(mesh.GetDefaultConfig().GetStatusPort()))
+		annotations["prometheus.io/path"] = "/stats/prometheus"
+		annotations["prometheus.io/scrape"] = "true"
+	}
+
+	patch = append(patch, addContainer(sic, pod.Spec.InitContainers, sic.InitContainers, "/spec/initContainers")...)
+	patch = append(patch, addContainer(sic, pod.Spec.Containers, sic.Containers, "/spec/containers")...)
+	patch = append(patch, addVolume(pod.Spec.Volumes, sic.Volumes, "/spec/volumes")...)
+	patch = append(patch, addImagePullSecrets(pod.Spec.ImagePullSecrets, sic.ImagePullSecrets, "/spec/imagePullSecrets")...)
+
+	if sic.DNSConfig != nil {
+		patch = append(patch, addPodDNSConfig(sic.DNSConfig, "/spec/dnsConfig")...)
+	}
+
+	if pod.Spec.SecurityContext != nil {
+		patch = append(patch, addSecurityContext(pod.Spec.SecurityContext, "/spec/securityContext")...)
+	}
+
+	patch = append(patch, updateAnnotation(pod.Annotations, annotations)...)
+
+	canonicalSvc, canonicalRev := ExtractCanonicalServiceLabels(pod.Labels, workloadName)
+	patchLabels := map[string]string{
+		label.TLSMode:                                model.IstioMutualTLSModeLabel,
+		model.IstioCanonicalServiceLabelName:         canonicalSvc,
+		label.IstioRev:                               revision,
+		model.IstioCanonicalServiceRevisionLabelName: canonicalRev,
+	}
+	if network := topologyValues(sic); network != "" {
+		// only added if if not already set
+		patchLabels[label.IstioNetwork] = network
+	}
+	patch = append(patch, addLabels(pod.Labels, patchLabels)...)
+
+	return json.Marshal(patch)
+}
+```
+
 ## 参考
 https://www.luozhiyun.com/archives/397
 
